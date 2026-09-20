@@ -20,6 +20,7 @@ class Config(BaseSettings):
     cpa_quota_timeout: float = 25.0
     cpa_quota_concurrency: int = 4
     cpa_quota_cache_ttl: float = 60.0
+    codex_refresh_enabled: bool = False
     reconnect_min: float = 1.0
     reconnect_max: float = 30.0
 

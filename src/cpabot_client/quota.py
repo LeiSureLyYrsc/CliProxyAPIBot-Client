@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -64,6 +65,9 @@ ANTIGRAVITY_PLAN_URLS = (
 
 ANTIGRAVITY_PLAN_BODY = '{"metadata":{"ideType":"ANTIGRAVITY"}}'
 
+CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+CODEX_RESET_CONSUME_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+
 _AUTH_MECHANISMS = {"oauth", "api_key", "api-key", "apikey", "session", "token"}
 
 _PLAN_BY_TIER_ID = {
@@ -95,6 +99,7 @@ WINDOW_ORDER = (
     "billing",
     "grok-build",
     "grok-chat",
+    "grok-imagine",
     "usage",
 )
 
@@ -111,6 +116,7 @@ class QuotaWindow:
     remaining: float | None = None
     limit: float | None = None
     reset_label: str = "-"
+    reset_at: float | None = None
 
 
 @dataclass
@@ -125,6 +131,9 @@ class AccountQuota:
     disabled: bool = False
     cooling: bool = False
     client_name: str = ""
+    subscription_expires_at: float | None = None
+    subscription_expires_label: str = ""
+    reset_credits: int | None = None
 
 
 @dataclass
@@ -269,12 +278,16 @@ def accounts_from_result(data: dict[str, Any] | Any) -> list[AccountQuota]:
                         remaining=window.remaining,
                         limit=window.limit,
                         reset_label=window.reset_label,
+                        reset_at=window.reset_at,
                     )
                     for window in item.windows
                 ],
                 disabled=item.disabled,
                 cooling=item.cooling,
                 client_name=item.client_name or result.client_name,
+                subscription_expires_at=item.subscription_expires_at,
+                subscription_expires_label=item.subscription_expires_label,
+                reset_credits=item.reset_credits,
             )
         )
     return accounts
@@ -342,6 +355,327 @@ def format_account_quota(account: AccountQuota) -> str:
     return "\n".join(lines)
 
 
+async def consume_codex_reset(
+    file: dict[str, Any],
+    *,
+    client: ManagementClient,
+    cfg: Config,
+) -> tuple[str, int | None]:
+    """
+    为指定凭证选择最早到期的可用重置券并向上游发起消费。
+    仅在上游明确成功时清空配额缓存，并返回 (message, remaining_credits)。
+    业务失败或上游异常时保留缓存并抛出 CPAError。
+    """
+    auth_index = str(file.get("auth_index") or "")
+    if not auth_index:
+        raise CPAError("该凭证没有 auth_index，无法刷新 Codex 额度。")
+    headers = _codex_headers(file)
+    credits_payload = await _codex_upstream(client, cfg, auth_index, "GET", CODEX_RESET_CREDITS_URL, headers)
+    credit = pick_codex_reset_credit(credits_payload)
+    if credit is None:
+        raise CPAError("没有可用的 Codex 重置次数。")
+    credit_id = _first_str(credit.get("id"), credit.get("credit_id"), credit.get("creditId"))
+    if not credit_id:
+        raise CPAError("重置券缺少 credit_id，无法消费。")
+    body = json.dumps({"credit_id": credit_id, "redeem_request_id": str(uuid.uuid4())})
+    result = await _codex_upstream(
+        client, cfg, auth_index, "POST", CODEX_RESET_CONSUME_URL, headers, data=body
+    )
+    ok, msg, rem = format_codex_refresh_result_struct(file, credit, result)
+    if not ok:
+        raise CPAError(msg)
+    clear_quota_cache()
+    return msg, rem
+
+
+def pick_codex_reset_credit(payload: dict[str, Any]) -> dict[str, Any] | None:
+    credits = _codex_credit_list(payload)
+    available = [item for item in credits if _codex_credit_available(item)]
+    if not available:
+        return None
+
+    def _expiry(item: dict[str, Any]) -> float:
+        stamp = _first_str(
+            item.get("expires_at"),
+            item.get("expiresAt"),
+            item.get("expire_at"),
+            item.get("expireAt"),
+        )
+        parsed = _parse_ts(stamp)
+        return parsed if parsed is not None else float("inf")
+
+    return min(available, key=_expiry)
+
+
+def format_codex_refresh_result(
+    file: dict[str, Any],
+    credit: dict[str, Any],
+    result: dict[str, Any],
+) -> str:
+    _, msg, _ = format_codex_refresh_result_struct(file, credit, result)
+    return msg
+
+
+def is_codex_refresh_success(code_or_status: str) -> bool:
+    return code_or_status.lower().strip() in {"", "ok", "success", "reset"}
+
+
+def format_codex_refresh_result_struct(
+    file: dict[str, Any],
+    credit: dict[str, Any],
+    result: dict[str, Any],
+) -> tuple[bool, str, int | None]:
+    name = display_name(file, public=True)
+    code = _first_str(result.get("code"), result.get("status")).lower()
+    remaining_str = _codex_remaining_count(result) or _codex_remaining_count(credit)
+    rem_int: int | None = None
+    if remaining_str:
+        try:
+            rem_int = int(remaining_str)
+        except (ValueError, TypeError):
+            pass
+    extra = f"剩余重置次数 {remaining_str}" if remaining_str else ""
+    if is_codex_refresh_success(code):
+        text = f"已为 {name} 消耗 1 次 Codex 重置次数，额度窗口已刷新。"
+        return True, f"{text}{(' ' + extra) if extra else ''}", rem_int
+    if code == "no_credit":
+        return False, f"{name} 没有可用的 Codex 重置次数。", rem_int
+    if code == "nothing_to_reset":
+        return False, f"{name} 当前没有需要重置的额度窗口。", rem_int
+    if code == "already_redeemed":
+        return False, f"{name} 这张重置券已经用过。", rem_int
+    error = _first_str(result.get("error"), result.get("message"), code) or "未知错误"
+    return False, f"{name} Codex 重置失败：{error}", rem_int
+
+
+async def _codex_upstream(
+    client: ManagementClient,
+    cfg: Config,
+    auth_index: str,
+    method: str,
+    url: str,
+    header: dict[str, str],
+    data: str | None = None,
+) -> dict[str, Any]:
+    response = await client.api_call(
+        auth_index,
+        method,
+        url,
+        header=header,
+        data=data,
+        timeout=cfg.cpa_quota_timeout,
+    )
+    status = int(response.get("status_code") or response.get("statusCode") or 0)
+    body = _parse_body(response.get("body"))
+    if status and not (200 <= status < 300):
+        detail = ""
+        if isinstance(body, dict):
+            detail = _first_str(body.get("error"), body.get("message"), body.get("code"))
+        raise CPAError(f"上游 HTTP {status}" + (f"：{detail}" if detail else ""))
+    if body is None:
+        raise CPAError("上游返回无法解析")
+    return body
+
+
+def count_codex_reset_credits(payload: dict[str, Any]) -> int | None:
+    """从 CODEX_RESET_CREDITS_URL 返回的数据中解析可用重置点数。"""
+    rem = _codex_remaining_count(payload)
+    if rem:
+        try:
+            return int(rem)
+        except (ValueError, TypeError):
+            pass
+    credits = _codex_credit_list(payload)
+    if credits:
+        available = [item for item in credits if _codex_credit_available(item)]
+        return len(available)
+    # 如果 payload 显式包含 credits/items 列表且为空，或者包含 count 字段
+    for key in ("count", "total", "available"):
+        val = payload.get(key)
+        if isinstance(val, int) and not isinstance(val, bool):
+            return val
+    return None
+
+
+def format_subscription_expiry_label(ts: float) -> str:
+    """格式化订阅到期时间，包含剩余倒计时与绝对日期。"""
+    dt = datetime.fromtimestamp(ts).astimezone()
+    date_str = dt.strftime("%Y-%m-%d")
+    now = time.time()
+    diff = ts - now
+    if diff <= 0:
+        return f"{date_str} (已过期)"
+    secs = int(diff)
+    days, rem = divmod(secs, 86400)
+    hours, _ = divmod(rem, 3600)
+    if days > 0:
+        rel = f"{days}天{hours}小时" if hours > 0 else f"{days}天"
+    elif hours > 0:
+        rel = f"{hours}小时"
+    else:
+        rel = "不足1小时"
+    return f"{date_str} (剩{rel})"
+
+
+def extract_subscription_expiry(data: dict[str, Any]) -> tuple[float | None, str]:
+    """
+    从凭证文件或响应字典中通用提取订阅到期时间。
+    可靠规则：
+    1. 顶级字段仅允许显式的 subscription_expires_at, subscriptionExpiresAt,
+       subscription_expiration, subscriptionExpiration,
+       chatgpt_subscription_active_until, chatgptSubscriptionActiveUntil,
+       subscription_active_until, subscriptionActiveUntil。
+       避免误判 auth token 过期字段 (expires_at, valid_until 等)。
+    2. 在明确的 subscription/plan/tier/paidTier/currentTier 以及 id_token/idToken 嵌套对象内，
+       提取订阅到期字段（包含 chatgpt_subscription_active_until / subscription_active_until / expires_at 等）。
+    3. 严禁将 xAI 的 billingPeriodEnd / billing_period_end 或 Codex rate_limit reset_at 视为订阅到期。
+    """
+    if not isinstance(data, dict):
+        return None, ""
+
+    explicit_top_keys = (
+        "subscription_expires_at",
+        "subscriptionExpiresAt",
+        "subscription_expiration",
+        "subscriptionExpiration",
+        "chatgpt_subscription_active_until",
+        "chatgptSubscriptionActiveUntil",
+        "subscription_active_until",
+        "subscriptionActiveUntil",
+    )
+    for key in explicit_top_keys:
+        if key in data and data[key] is not None and data[key] != "":
+            parsed_ts = _parse_any_ts(data[key])
+            if parsed_ts is not None and parsed_ts > 0:
+                return parsed_ts, format_subscription_expiry_label(parsed_ts)
+
+    # 优先检查 id_token / idToken 嵌套中的显式 subscription_active_until / chatgpt_subscription_active_until
+    id_token = data.get("id_token") or data.get("idToken")
+    if isinstance(id_token, dict):
+        id_token_keys = (
+            "chatgpt_subscription_active_until",
+            "chatgptSubscriptionActiveUntil",
+            "subscription_active_until",
+            "subscriptionActiveUntil",
+            "subscription_expires_at",
+            "subscriptionExpiresAt",
+            "subscription_expiration",
+            "subscriptionExpiration",
+        )
+        for key in id_token_keys:
+            if key in id_token and id_token[key] is not None and id_token[key] != "":
+                parsed_ts = _parse_any_ts(id_token[key])
+                if parsed_ts is not None and parsed_ts > 0:
+                    return parsed_ts, format_subscription_expiry_label(parsed_ts)
+
+    nested_sub_keys = (
+        "subscription",
+        "plan",
+        "tier",
+        "paidTier",
+        "paid_tier",
+        "currentTier",
+        "current_tier",
+    )
+    candidate_nested_keys = (
+        "chatgpt_subscription_active_until", "chatgptSubscriptionActiveUntil",
+        "subscription_active_until", "subscriptionActiveUntil",
+        "expires_at", "expiresAt", "expire_at", "expireAt",
+        "subscription_expires_at", "subscriptionExpiresAt",
+        "subscription_expiration", "subscriptionExpiration",
+        "expires", "expire", "valid_until", "validUntil",
+        "end_date", "endDate", "next_billing_date", "nextBillingDate",
+    )
+
+    for n_key in nested_sub_keys:
+        nested = data.get(n_key)
+        if isinstance(nested, dict):
+            for key in candidate_nested_keys:
+                if key in nested and nested[key] is not None and nested[key] != "":
+                    parsed_ts = _parse_any_ts(nested[key])
+                    if parsed_ts is not None and parsed_ts > 0:
+                        return parsed_ts, format_subscription_expiry_label(parsed_ts)
+
+    return None, ""
+
+
+def _parse_any_ts(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts / 1000.0 if ts > 1e12 else ts
+    text = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+    try:
+        val = float(text)
+        return val / 1000.0 if val > 1e12 else val
+    except Exception:
+        pass
+    return None
+
+
+def _codex_headers(file: dict[str, Any]) -> dict[str, str]:
+    headers = {
+        "Authorization": "Bearer $TOKEN$",
+        "Content-Type": "application/json",
+        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+    }
+    account_id = _first_str(
+        file.get("chatgpt_account_id"),
+        file.get("chatgptAccountId"),
+        file.get("account_id"),
+        file.get("accountId"),
+    )
+    if account_id and "@" not in account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+    return headers
+
+
+def _codex_credit_available(item: dict[str, Any]) -> bool:
+    status = _first_str(item.get("status"), item.get("state")).lower()
+    if status and status not in {"available", "ok", "active", "unused"}:
+        return False
+    if item.get("redeemed") or item.get("redeemed_at") or item.get("redeemedAt"):
+        return False
+    return True
+
+
+def _codex_remaining_count(*payloads: dict[str, Any]) -> str:
+    for payload in payloads:
+        value = payload.get("available_count")
+        if value is None:
+            value = payload.get("availableCount")
+        if value is None:
+            value = payload.get("remaining")
+        if value is not None and value != "":
+            return str(value)
+    return ""
+
+
+def _parse_ts(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, TypeError):
+        pass
+    try:
+        val = float(value)
+        return val / 1000.0 if val > 1e12 else val
+    except (ValueError, TypeError):
+        return None
+
+
 async def _one_account(
     client: ManagementClient,
     cfg: Config,
@@ -349,6 +683,7 @@ async def _one_account(
     sem: asyncio.Semaphore,
 ) -> AccountQuota:
     platform = platform_of(file)
+    exp_ts, exp_label = extract_subscription_expiry(file)
     report = AccountQuota(
         platform=platform,
         name=display_name(file, public=True),
@@ -357,6 +692,8 @@ async def _one_account(
         status=str(file.get("status") or "unknown"),
         disabled=bool(file.get("disabled")),
         cooling=is_cooling(file),
+        subscription_expires_at=exp_ts,
+        subscription_expires_label=exp_label,
     )
     if is_unhealthy(file) and report.status in {"ready", "ok", "active", "unknown"}:
         report.status = "cooling" if report.cooling else str(file.get("status") or "error")
@@ -402,6 +739,23 @@ async def _fill_claude(client: ManagementClient, cfg: Config, report: AccountQuo
     report.status = _status_from_windows(report.windows, report)
     report.plan = _sanitize_plan(plan) or report.plan
     report.error = ""
+    if not report.subscription_expires_label:
+        exp_ts, exp_label = extract_subscription_expiry(payload)
+        if exp_label:
+            report.subscription_expires_at = exp_ts
+            report.subscription_expires_label = exp_label
+
+
+def _codex_credit_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("credits", "items", "rate_limit_reset_credits", "rateLimitResetCredits"):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            return [item for item in raw if isinstance(item, dict)]
+        if isinstance(raw, dict):
+            nested = raw.get("credits") or raw.get("items")
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
 
 
 async def _fill_codex(
@@ -410,20 +764,7 @@ async def _fill_codex(
     file: dict[str, Any],
     report: AccountQuota,
 ) -> None:
-    headers = {
-        "Authorization": "Bearer $TOKEN$",
-        "Content-Type": "application/json",
-        "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
-    }
-    account_id = _first_str(
-        file.get("chatgpt_account_id"),
-        file.get("chatgptAccountId"),
-        file.get("account_id"),
-        file.get("accountId"),
-        file.get("account"),
-    )
-    if account_id:
-        headers["Chatgpt-Account-Id"] = account_id
+    headers = _codex_headers(file)
     payload = await _upstream_json(
         client,
         cfg,
@@ -432,13 +773,39 @@ async def _fill_codex(
         "https://chatgpt.com/backend-api/wham/usage",
         headers,
     )
-    if payload is None:
-        return
-    windows, plan = parse_codex_usage(payload)
-    report.windows = sort_windows(windows)
-    report.status = _status_from_windows(report.windows, report)
-    report.plan = _sanitize_plan(plan) or report.plan
-    report.error = ""
+    if payload is not None:
+        windows, plan = parse_codex_usage(payload)
+        report.windows = sort_windows(windows)
+        report.status = _status_from_windows(report.windows, report)
+        report.plan = _sanitize_plan(plan) or report.plan
+        report.error = ""
+        if not report.subscription_expires_label:
+            exp_ts, exp_label = extract_subscription_expiry(payload)
+            if exp_label:
+                report.subscription_expires_at = exp_ts
+                report.subscription_expires_label = exp_label
+
+    # Codex reset credits read-only GET check; failure must not overwrite usage state.
+    saved_error = report.error
+    saved_status = report.status
+    try:
+        credits_payload = await _upstream_json(
+            client,
+            cfg,
+            report,
+            "GET",
+            CODEX_RESET_CREDITS_URL,
+            headers,
+        )
+        if credits_payload is not None:
+            credits_count = count_codex_reset_credits(credits_payload)
+            if credits_count is not None:
+                report.reset_credits = credits_count
+    except Exception:
+        pass
+    finally:
+        report.error = saved_error
+        report.status = saved_status
 
 
 async def _fill_kimi(client: ManagementClient, cfg: Config, report: AccountQuota) -> None:
@@ -455,6 +822,11 @@ async def _fill_kimi(client: ManagementClient, cfg: Config, report: AccountQuota
     report.windows = sort_windows(parse_kimi_usage(payload))
     report.status = _status_from_windows(report.windows, report)
     report.error = ""
+    if not report.subscription_expires_label:
+        exp_ts, exp_label = extract_subscription_expiry(payload)
+        if exp_label:
+            report.subscription_expires_at = exp_ts
+            report.subscription_expires_label = exp_label
 
 
 async def _fill_xai(client: ManagementClient, cfg: Config, report: AccountQuota) -> None:
@@ -476,6 +848,7 @@ async def _fill_xai(client: ManagementClient, cfg: Config, report: AccountQuota)
     report.windows = sort_windows(parse_xai_billing(payload))
     report.status = _status_from_windows(report.windows, report)
     report.error = ""
+    # Note: Requirement: Do NOT treat xAI billingPeriodEnd as subscription expiry.
 
 
 async def _fill_antigravity(client: ManagementClient, cfg: Config, report: AccountQuota) -> None:
@@ -497,6 +870,11 @@ async def _fill_antigravity(client: ManagementClient, cfg: Config, report: Accou
     plan = await _antigravity_plan(client, cfg, report)
     if plan:
         report.plan = plan
+    if not report.subscription_expires_label:
+        exp_ts, exp_label = extract_subscription_expiry(payload)
+        if exp_label:
+            report.subscription_expires_at = exp_ts
+            report.subscription_expires_label = exp_label
 
 
 async def _fill_gemini(client: ManagementClient, cfg: Config, report: AccountQuota) -> None:
@@ -524,7 +902,12 @@ async def _fill_gemini(client: ManagementClient, cfg: Config, report: AccountQuo
             remain = _first_number(item.get("remainingFraction"), item.get("remaining"))
             limit = _first_number(item.get("limit"), item.get("quota"))
             used = _first_number(item.get("used"), item.get("usedPercent"))
-            window = QuotaWindow(id=label, label=label, reset_label=_iso_reset(item.get("resetTime") or item.get("resetAt")))
+            window = QuotaWindow(
+                id=label,
+                label=label,
+                reset_label=_iso_reset(item.get("resetTime") or item.get("resetAt")),
+                reset_at=_parse_ts(_first_str(item.get("resetTime"), item.get("resetAt"))),
+            )
             if remain is not None and remain <= 1:
                 window.remaining_percent = _clamp(remain * 100.0)
                 window.used_percent = _clamp(100.0 - window.remaining_percent)
@@ -540,6 +923,11 @@ async def _fill_gemini(client: ManagementClient, cfg: Config, report: AccountQuo
     report.windows = sort_windows(windows)
     report.status = _status_from_windows(report.windows, report)
     report.error = ""
+    if not report.subscription_expires_label:
+        exp_ts, exp_label = extract_subscription_expiry(payload)
+        if exp_label:
+            report.subscription_expires_at = exp_ts
+            report.subscription_expires_label = exp_label
 
 
 def parse_claude_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], str]:
@@ -549,7 +937,13 @@ def parse_claude_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], str]
         if not isinstance(item, dict):
             continue
         used = _number(item.get("utilization"))
-        window = QuotaWindow(id=key, label=label, reset_label=_iso_reset(item.get("resets_at")))
+        reset_str = item.get("resets_at") or item.get("reset_at")
+        window = QuotaWindow(
+            id=key,
+            label=label,
+            reset_label=_iso_reset(reset_str),
+            reset_at=_parse_ts(reset_str) if reset_str else None,
+        )
         if used is not None:
             window.used_percent = _clamp(used)
             window.remaining_percent = _clamp(100.0 - window.used_percent)
@@ -595,6 +989,23 @@ def parse_kimi_usage(payload: dict[str, Any]) -> list[QuotaWindow]:
     )
 
 
+def _slugify_grok_product(name: str) -> str:
+    """
+    将产品名规范化为 ID，例如 GrokImagine -> grok-imagine, GrokChat -> grok-chat, GrokBuild -> grok-build。
+    处理 CamelCase、空格、下划线、连字符。
+    """
+    cleaned = re.sub(r"[_\s]+", "-", name.strip())
+    # CamelCase 转 kebab-case: 例如 GrokImagine -> Grok-Imagine
+    s1 = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", cleaned)
+    s2 = re.sub(r"([A-Z]+)([A-Z][a-z0-9])", r"\1-\2", s1)
+    slug = re.sub(r"[^a-zA-Z0-9\-]+", "", s2).strip("-").lower()
+    if not slug:
+        return ""
+    if not slug.startswith("grok-") and slug != "grok":
+        slug = f"grok-{slug}"
+    return slug
+
+
 def parse_xai_billing(payload: dict[str, Any]) -> list[QuotaWindow]:
     config = _as_dict(payload.get("config")) or payload
     windows: list[QuotaWindow] = []
@@ -604,21 +1015,75 @@ def parse_xai_billing(payload: dict[str, Any]) -> list[QuotaWindow]:
         config.get("usedPercent"),
         payload.get("creditUsagePercent"),
     )
+    current_period = (
+        _as_dict(config.get("currentPeriod"))
+        or _as_dict(config.get("current_period"))
+        or _as_dict(payload.get("currentPeriod"))
+        or _as_dict(payload.get("current_period"))
+        or {}
+    )
+    period_end = (
+        config.get("billingPeriodEnd")
+        or config.get("billing_period_end")
+        or payload.get("billingPeriodEnd")
+        or payload.get("billing_period_end")
+        or current_period.get("end")
+        or current_period.get("end_time")
+        or current_period.get("endTime")
+    )
     weekly = QuotaWindow(
         id="billing",
-        label="周",
-        reset_label=_human_reset(
-            config.get("billingPeriodEnd") or config.get("billing_period_end") or payload.get("billingPeriodEnd")
-        ),
+        label="周额度",
+        reset_label=_human_reset(period_end),
+        reset_at=_parse_ts(str(period_end)) if period_end else None,
     )
     if weekly_used is not None:
         weekly.used_percent = _clamp(weekly_used)
         weekly.remaining_percent = _clamp(100.0 - weekly.used_percent)
         windows.append(weekly)
+
+    seen_ids: set[str] = set()
+    dynamic_windows: list[QuotaWindow] = []
+
+    lists_to_check: list[list[Any]] = []
+    for container in (payload, config if config is not payload else None):
+        if not isinstance(container, dict):
+            continue
+        for lk in ("productUsage", "product_usage", "products", "usages"):
+            val = container.get(lk)
+            if isinstance(val, list) and val not in lists_to_check:
+                lists_to_check.append(val)
+
+    for prod_list in lists_to_check:
+        for item in prod_list:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("product") or item.get("title") or "").strip()
+            used = _first_number(
+                item.get("usagePercent"),
+                item.get("usedPercent"),
+                item.get("creditUsagePercent"),
+                item.get("usage_percent"),
+                item.get("used_percent"),
+                item.get("credit_usage_percent"),
+            )
+            if not name or used is None:
+                continue
+            window_id = _slugify_grok_product(name)
+            if not window_id or window_id in seen_ids or window_id == "billing":
+                continue
+            seen_ids.add(window_id)
+            w = QuotaWindow(id=window_id, label=name)
+            w.used_percent = _clamp(used)
+            w.remaining_percent = _clamp(100.0 - w.used_percent)
+            dynamic_windows.append(w)
+
     for window_id, label, keys in (
         ("grok-build", "GrokBuild", ("grokBuildUsagePercent", "grok_build_usage_percent", "grokBuildUsage")),
         ("grok-chat", "GrokChat", ("grokChatUsagePercent", "grok_chat_usage_percent", "grokChatUsage")),
     ):
+        if window_id in seen_ids:
+            continue
         used = None
         for key in keys:
             used = _number(config.get(key))
@@ -628,28 +1093,17 @@ def parse_xai_billing(payload: dict[str, Any]) -> list[QuotaWindow]:
                 break
         if used is None:
             continue
+        seen_ids.add(window_id)
         window = QuotaWindow(id=window_id, label=label)
         window.used_percent = _clamp(used)
         window.remaining_percent = _clamp(100.0 - window.used_percent)
-        windows.append(window)
-    products = payload.get("products") or config.get("products") or payload.get("usages")
-    if isinstance(products, list):
-        for item in products:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("product") or item.get("title") or "").strip()
-            used = _first_number(item.get("usagePercent"), item.get("usedPercent"), item.get("creditUsagePercent"))
-            if not name or used is None:
-                continue
-            key = name.lower().replace(" ", "")
-            window_id = "grok-build" if "build" in key else "grok-chat" if "chat" in key else key
-            if any(existing.id == window_id for existing in windows):
-                continue
-            window = QuotaWindow(id=window_id, label=name)
-            window.used_percent = _clamp(used)
-            window.remaining_percent = _clamp(100.0 - window.used_percent)
-            windows.append(window)
-    return sort_windows(windows)
+        dynamic_windows.append(window)
+
+    indexed = {wid: index for index, wid in enumerate(WINDOW_ORDER)}
+    dynamic_windows.sort(key=lambda w: (indexed.get(w.id, len(WINDOW_ORDER)), w.id, w.label))
+
+    windows.extend(dynamic_windows)
+    return windows
 
 
 def parse_antigravity_summary(payload: dict[str, Any]) -> list[QuotaWindow]:
@@ -666,10 +1120,12 @@ def parse_antigravity_summary(payload: dict[str, Any]) -> list[QuotaWindow]:
             )
             window_id, label = _antigravity_window(group_name, raw_label)
             remain = _first_number(bucket.get("remainingFraction"), bucket.get("remaining_fraction"))
+            reset_str = bucket.get("resetTime") or bucket.get("reset_time")
             window = QuotaWindow(
                 id=window_id,
                 label=label,
-                reset_label=_iso_reset(bucket.get("resetTime") or bucket.get("reset_time")),
+                reset_label=_iso_reset(reset_str),
+                reset_at=_parse_ts(reset_str) if reset_str else None,
             )
             if remain is not None:
                 frac = remain if remain <= 1 else remain / 100.0
@@ -744,6 +1200,14 @@ def _plan_from_auth_file(file: dict[str, Any]) -> str:
         plan = _sanitize_plan(subscription.get("plan") or subscription.get("tierName") or subscription.get("name"))
         if plan:
             return plan
+
+    id_token = file.get("id_token") or file.get("idToken")
+    if isinstance(id_token, dict):
+        for key in ("plan_type", "planType", "plan", "tier", "tier_name", "tierName"):
+            plan = _sanitize_plan(id_token.get(key))
+            if plan:
+                return plan
+
     for key in ("plan", "plan_type", "planType", "tier", "tier_name", "tierName"):
         plan = _sanitize_plan(file.get(key))
         if plan:
@@ -757,6 +1221,10 @@ def _plan_from_name(name: str) -> str:
         return "Ultra Lite"
     if "ultra" in blob:
         return "Ultra"
+    if "team" in blob:
+        return "Team"
+    if "enterprise" in blob:
+        return "Enterprise"
     if "plus" in blob:
         return "Plus"
     if "pro" in blob:
@@ -769,8 +1237,27 @@ def _plan_from_name(name: str) -> str:
 
 
 def _sanitize_plan(value: Any) -> str:
+    if isinstance(value, dict):
+        # 递归提取嵌套字典中常见字段
+        extracted = (
+            value.get("name")
+            or value.get("tierName")
+            or value.get("tier_name")
+            or value.get("plan")
+            or value.get("tier")
+            or value.get("id")
+            or value.get("tierId")
+            or value.get("tier_id")
+        )
+        if extracted and isinstance(extracted, str):
+            return _sanitize_plan(extracted)
+        return ""
     text = str(value or "").strip()
     if not text:
+        return ""
+    if text.startswith("{") and text.endswith("}"):
+        return ""
+    if "{" in text or "}" in text:
         return ""
     if "@" in text:
         return ""
@@ -938,7 +1425,7 @@ def _format_platform(section: PlatformQuota, account_limit: int) -> list[str]:
         if account.disabled:
             flags.append("disabled")
         if account.cooling:
-            flags.append("cooling")
+            flags.append("冷却中")
         flag = f" [{' '.join(flags)}]" if flags else ""
         plan = f" ({account.plan})" if account.plan else ""
         if account.error:
@@ -976,14 +1463,14 @@ def _status_from_windows(windows: list[QuotaWindow], report: AccountQuota) -> st
         return "disabled"
     percents = [w.remaining_percent for w in windows if w.remaining_percent is not None]
     if not percents:
-        return report.status or "unknown"
+        return "冷却中" if report.cooling else (report.status or "unknown")
     lowest = min(percents)
     if lowest <= 0:
         return "exhausted"
     if lowest <= 15:
         return "low"
     if report.cooling:
-        return "cooling"
+        return "冷却中"
     return "ok"
 
 
@@ -1010,7 +1497,19 @@ def _codex_windows(rate: dict[str, Any] | None) -> tuple[dict[str, Any] | None, 
 
 def _codex_window(window_id: str, label: str, window: dict[str, Any], rate: dict[str, Any] | None) -> QuotaWindow:
     used = _first_number(window.get("used_percent"), window.get("usedPercent"))
-    item = QuotaWindow(id=window_id, label=label, reset_label=_codex_reset(window))
+    reset_ts = _first_number(window.get("reset_at"), window.get("resetAt"))
+    if reset_ts:
+        reset_epoch = reset_ts / 1000.0 if reset_ts > 1e12 else reset_ts
+    else:
+        secs = _first_number(window.get("reset_after_seconds"), window.get("resetAfterSeconds"))
+        reset_epoch = (time.time() + secs) if secs else None
+
+    item = QuotaWindow(
+        id=window_id,
+        label=label,
+        reset_label=_codex_reset(window),
+        reset_at=reset_epoch,
+    )
     if used is not None:
         item.used_percent = _clamp(used)
         item.remaining_percent = _clamp(100.0 - item.used_percent)
@@ -1024,12 +1523,18 @@ def _kimi_window(window_id: str, label: str, data: dict[str, Any]) -> QuotaWindo
     used = _number(data.get("used"))
     limit = _number(data.get("limit"))
     remaining = _number(data.get("remaining"))
+    reset_val = data.get("resetAt") or data.get("reset_at") or data.get("resetTime")
+    reset_epoch = _parse_ts(str(reset_val)) if reset_val else None
+    if reset_epoch is None and isinstance(reset_val, (int, float)) and not isinstance(reset_val, bool):
+        reset_epoch = float(reset_val) / 1000.0 if float(reset_val) > 1e12 else float(reset_val)
+
     window = QuotaWindow(
         id=window_id,
         label=label,
         remaining=remaining,
         limit=limit,
-        reset_label=_iso_reset(data.get("resetAt") or data.get("reset_at") or data.get("resetTime")),
+        reset_label=_iso_reset(reset_val),
+        reset_at=reset_epoch,
     )
     if remaining is not None and limit:
         window.remaining_percent = _clamp(remaining / limit * 100.0)

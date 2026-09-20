@@ -1,3 +1,3 @@
-"""独立 CPA 额度客户端：无 Bot 功能，只向 Server_Mode 上报只读额度。"""
+"""独立 CPA 客户端：无 Bot 逻辑，向 Server_Mode 上报额度与受控执行受限指令。"""
 
 __version__ = "0.1.0"

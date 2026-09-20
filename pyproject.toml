@@ -1,7 +1,7 @@
 [project]
 name = "cpabot-client"
 version = "0.1.0"
-description = "Read-only CPA quota client for CliProxyAPI Bot Server_Mode"
+description = "CPA quota client with optional controlled Codex refresh for CliProxyAPI Bot Server_Mode"
 readme = "README.md"
 requires-python = ">=3.10, <4.0"
 dependencies = [

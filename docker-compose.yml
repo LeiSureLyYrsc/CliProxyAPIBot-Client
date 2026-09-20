@@ -1,0 +1,10 @@
+services:
+  cpabot-client:
+    image: ghcr.io/leisurelyyrsc/cliproxyapibot-client:latest
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

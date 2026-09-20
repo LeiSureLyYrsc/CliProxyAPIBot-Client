@@ -11,13 +11,23 @@ from .management import CPAError, ManagementClient
 from .protocol import (
     ALLOWED_ACTIONS,
     AccountQuotaDTO,
+    CodexRefreshPayload,
+    CodexRefreshResult,
     Envelope,
     PROTOCOL_VERSION,
     QuotaQueryPayload,
     QuotaQueryResult,
     QuotaWindowDTO,
 )
-from .quota import AccountQuota, collect_quotas, is_platform_query, normalize_platform, platform_of, stamp_client
+from .quota import (
+    AccountQuota,
+    collect_quotas,
+    consume_codex_reset,
+    is_platform_query,
+    normalize_platform,
+    platform_of,
+    stamp_client,
+)
 
 
 def account_to_dto(account: AccountQuota) -> AccountQuotaDTO:
@@ -37,12 +47,16 @@ def account_to_dto(account: AccountQuota) -> AccountQuotaDTO:
                 remaining=window.remaining,
                 limit=window.limit,
                 reset_label=window.reset_label,
+                reset_at=window.reset_at,
             )
             for window in account.windows
         ],
         disabled=account.disabled,
         cooling=account.cooling,
         client_name=account.client_name,
+        subscription_expires_at=account.subscription_expires_at,
+        subscription_expires_label=account.subscription_expires_label,
+        reset_credits=account.reset_credits,
     )
 
 
@@ -67,10 +81,23 @@ async def handle_envelope(cfg: Config, client: ManagementClient, raw: dict[str, 
             type="response",
             id=envelope.id,
             ok=False,
-            error="只允许 quota.query",
+            error="未知的 action",
         ).model_dump()
     try:
-        result = await run_quota_query(cfg, client, envelope.payload or {})
+        if envelope.action == "quota.query":
+            result = await run_quota_query(cfg, client, envelope.payload or {})
+            result_dict = result.model_dump()
+        elif envelope.action == "codex.refresh":
+            refresh_res = await run_codex_refresh(cfg, client, envelope.payload or {})
+            result_dict = refresh_res.model_dump()
+        else:
+            return Envelope(
+                version=PROTOCOL_VERSION,
+                type="response",
+                id=envelope.id,
+                ok=False,
+                error="未支持的 action",
+            ).model_dump()
     except (CPAError, ValidationError) as exc:
         return Envelope(
             version=PROTOCOL_VERSION,
@@ -84,8 +111,25 @@ async def handle_envelope(cfg: Config, client: ManagementClient, raw: dict[str, 
         type="response",
         id=envelope.id,
         ok=True,
-        result=result.model_dump(),
+        result=result_dict,
     ).model_dump()
+
+
+async def run_codex_refresh(
+    cfg: Config, client: ManagementClient, payload: dict[str, Any]
+) -> CodexRefreshResult:
+    if not cfg.codex_refresh_enabled:
+        raise CPAError("客户端未启用 Codex 额度刷新功能（CODEX_REFRESH_ENABLED=false）")
+    req = CodexRefreshPayload.model_validate(payload)
+    files = await client.list_auth_files()
+    codex_files = [item for item in files if platform_of(item) == "codex"]
+    matched = match_auth(codex_files, req.account)
+    if not matched:
+        raise CPAError(f"没有找到 Codex 凭证：{req.account}")
+    if len(matched) > 1:
+        raise CPAError(f"「{req.account}」匹配到多个 Codex 凭证")
+    msg, rem = await consume_codex_reset(matched[0], client=client, cfg=cfg)
+    return CodexRefreshResult(message=msg, remaining_credits=rem)
 
 
 async def run_quota_query(cfg: Config, client: ManagementClient, payload: dict[str, Any]) -> QuotaQueryResult:

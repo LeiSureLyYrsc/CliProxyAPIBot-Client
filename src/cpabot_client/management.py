@@ -12,6 +12,8 @@ _FORBIDDEN_COOLDOWN = 300.0
 _API_CALL_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("api.anthropic.com", "/api/oauth/usage"): frozenset({"GET"}),
     ("chatgpt.com", "/backend-api/wham/usage"): frozenset({"GET"}),
+    ("chatgpt.com", "/backend-api/wham/rate-limit-reset-credits"): frozenset({"GET"}),
+    ("chatgpt.com", "/backend-api/wham/rate-limit-reset-credits/consume"): frozenset({"POST"}),
     ("api.kimi.com", "/coding/v1/usages"): frozenset({"GET"}),
     ("cli-chat-proxy.grok.com", "/v1/billing"): frozenset({"GET"}),
     ("daily-cloudcode-pa.googleapis.com", "/v1internal:retrieveUserQuotaSummary"): frozenset({"POST"}),

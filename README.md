@@ -2,25 +2,27 @@
 
 用于 [CliProxyAPI-Bot](https://github.com/LeiSureLyYrsc/CliProxyAPI-Bot) `Server_Mode` 的独立 Python 客户端。
 
-客户端不依赖 NoneBot，也没有聊天机器人、凭证管理或额度重置功能。它主动通过 WebSocket 连接 Bot 的独立 FastAPI 服务，在收到查询请求后读取本机 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的额度信息并返回结果。
+客户端不依赖 NoneBot，也没有聊天机器人或凭证管理功能，额度重置功能默认关闭（仅可选开启 Codex 官方重置券消费）。它主动通过 WebSocket 连接 Bot 的独立 FastAPI 服务，在收到查询请求后读取本机 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的额度信息并返回结果。
 
 ## 功能
 
 - 主动连接 Bot 的 `Server_Mode`，适合客户端位于 NAT 或家庭网络后的场景
 - 查询本机 CLIProxyAPI 的 Claude、Codex、Antigravity、Kimi、xAI 等额度
+- 包含绝对时间戳 `reset_at`、订阅到期时间与 Codex 可用重置点数查询
 - 支持按平台或账号查询
 - 自动心跳、断线重连和指数退避
 - 每个客户端使用独立名称和独立连接密钥
 - 同一服务器同一时刻不允许多个同名客户端连接
 - 不回传 `CPA_MANAGEMENT_KEY`、Access Token 或 `auth_index`
-- 严格限制为只读额度查询
+- 默认只读，开关启用时仅允许 Codex 官方重置券消费
 
 ## 安全边界
 
-客户端只接受协议动作：
+客户端只接受受控协议动作：
 
 ```text
 quota.query
+codex.refresh
 ```
 
 本机 CLIProxyAPI 管理接口只允许：
@@ -30,12 +32,13 @@ GET  /v0/management/auth-files
 POST /v0/management/api-call
 ```
 
-其中 `/api-call` 只能请求代码内置的额度上游地址，并同时校验固定 HTTP 方法。服务器不能传入任意 URL、Header 模板、请求方法或管理 API 路径。
+其中 `/api-call` 只能请求代码内置的额度上游地址，并同时校验固定 HTTP 方法（例如 `wham/usage` 仅限 `GET`，`wham/rate-limit-reset-credits/consume` 仅限 `POST`）。服务器不能传入任意 URL、Header 模板、请求方法或管理 API 路径。
+
+此外，Codex 重置功能受客户端本地配置 `CODEX_REFRESH_ENABLED` 控制（默认为 `false` 关闭）。关闭时客户端会直接在本地拒绝 `codex.refresh` 指令，零网络副作用。
 
 客户端没有以下实现：
 
 - `reset-quota`
-- Codex 重置次数消费
 - 凭证启用、禁用或删除
 - OAuth 登录
 - 配置读写
@@ -68,6 +71,66 @@ Windows PowerShell：
 
 ```powershell
 Copy-Item .env.example .env
+```
+
+## Docker Compose
+
+预构建镜像发布到：
+
+```text
+ghcr.io/leisurelyyrsc/cliproxyapibot-client:latest
+```
+
+先复制并编辑配置：
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+容器访问宿主机上的 CLIProxyAPI 时，将 `.env` 中的地址设置为：
+
+```env
+CPA_BASE_URL=http://host.docker.internal:8317
+```
+
+`SERVER_URL` 必须指向 Bot 的实际 WebSocket 地址；Bot 在另一台机器或域名后时不要使用容器内的 `127.0.0.1`。
+
+拉取并启动：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+查看日志：
+
+```bash
+docker compose logs -f cpabot-client
+```
+
+更新到最新镜像：
+
+```bash
+docker compose pull
+docker compose up -d --remove-orphans
+```
+
+仓库的 GitHub Actions 会在以下情况自动构建并发布 `linux/amd64`、`linux/arm64` 镜像：
+
+- 推送到 `main`：更新 `latest` 和提交 SHA 标签
+- 推送 `v*` 标签：发布对应版本与 SemVer 标签
+- 手动运行 `Build and publish Docker image` workflow
+
+GHCR 包首次发布后可能需要在 GitHub Packages 设置中改为公开。若包保持私有，拉取前需登录：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
 ```
 
 编辑 `.env`：

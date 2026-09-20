@@ -7,13 +7,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 PROTOCOL_VERSION = 1
-ALLOWED_ACTIONS = frozenset({"quota.query"})
+ALLOWED_ACTIONS = frozenset({"quota.query", "codex.refresh"})
 MAX_CLIENT_NAME_LEN = 32
 MAX_ACCOUNTS = 200
 MAX_WINDOWS = 32
 CLIENT_NAME_RE = re.compile(r"^[^\s/\\]{1,32}$")
 
-QuotaAction = Literal["quota.query"]
+QuotaAction = Literal["quota.query", "codex.refresh"]
 
 
 def normalize_client_name(value: str) -> str:
@@ -71,6 +71,7 @@ class QuotaWindowDTO(BaseModel):
     remaining: float | None = None
     limit: float | None = None
     reset_label: str = "-"
+    reset_at: float | None = None
 
 
 class AccountQuotaDTO(BaseModel):
@@ -84,6 +85,9 @@ class AccountQuotaDTO(BaseModel):
     disabled: bool = False
     cooling: bool = False
     client_name: str = ""
+    subscription_expires_at: float | None = None
+    subscription_expires_label: str = ""
+    reset_credits: int | None = None
 
     @field_validator("windows")
     @classmethod
@@ -101,3 +105,20 @@ class QuotaQueryResult(BaseModel):
     @classmethod
     def limit_accounts(cls, value: list[AccountQuotaDTO]) -> list[AccountQuotaDTO]:
         return value[:MAX_ACCOUNTS]
+
+
+class CodexRefreshPayload(BaseModel):
+    account: str
+
+    @field_validator("account", mode="before")
+    @classmethod
+    def validate_account(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("account 不能为空")
+        return text
+
+
+class CodexRefreshResult(BaseModel):
+    message: str
+    remaining_credits: int | None = None
