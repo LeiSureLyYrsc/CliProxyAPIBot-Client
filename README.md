@@ -1,6 +1,6 @@
-# CliProxyAPIBot Client
+# QuotaNoa Client
 
-用于 [CliProxyAPI-Bot](https://github.com/LeiSureLyYrsc/CliProxyAPI-Bot) `Server_Mode` 的独立 Python 客户端。
+用于 [QuotaNoa-Bot](https://github.com/LeiSureLyYrsc/QuotaNoa-Bot) `Server_Mode` 的独立 Python 客户端。
 
 客户端不依赖 NoneBot，也没有聊天机器人或凭证管理功能，额度重置功能默认关闭（仅可选开启 Codex 官方重置券消费）。它主动通过 WebSocket 连接 Bot 的独立 FastAPI 服务，在收到查询请求后读取本机 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的额度信息并返回结果。
 
@@ -50,14 +50,14 @@ POST /v0/management/api-call
 
 - Python 3.10+
 - 可访问本机 CLIProxyAPI 管理接口
-- 可通过 WebSocket 访问已启用 `Server_Mode` 的 CliProxyAPI-Bot
+- 可通过 WebSocket 访问已启用 `Server_Mode` 的 QuotaNoa-Bot
 - 推荐使用 [uv](https://docs.astral.sh/uv/)
 
 ## 快速开始
 
 ```bash
-git clone https://github.com/LeiSureLyYrsc/CliProxyAPIBot-Client.git
-cd CliProxyAPIBot-Client
+git clone https://github.com/LeiSureLyYrsc/QuotaNoa-Client.git
+cd QuotaNoa-Client
 uv sync
 ```
 
@@ -78,7 +78,7 @@ Copy-Item .env.example .env
 预构建镜像发布到：
 
 ```text
-ghcr.io/leisurelyyrsc/cliproxyapibot-client:latest
+ghcr.io/leisurelyyrsc/quotanoa-client:latest
 ```
 
 先复制并编辑配置：
@@ -111,7 +111,7 @@ docker compose up -d
 查看日志：
 
 ```bash
-docker compose logs -f cpabot-client
+docker compose logs -f quotanoa-client
 ```
 
 更新到最新镜像：
@@ -147,7 +147,7 @@ CPA_MANAGEMENT_KEY=plaintext-management-password
 启动：
 
 ```bash
-uv run cpabot-client
+uv run quotanoa-client
 ```
 
 也可以使用模块入口：
@@ -158,7 +158,7 @@ uv run python -m cpabot_client
 
 ## Bot 服务端配置
 
-在 CliProxyAPI-Bot 的 `.env.prod` 中启用独立服务器：
+在 QuotaNoa-Bot 的 `.env.prod` 中启用独立服务器：
 
 ```env
 SERVER_MODE=true

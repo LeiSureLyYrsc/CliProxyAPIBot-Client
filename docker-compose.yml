@@ -1,6 +1,6 @@
 services:
-  cpabot-client:
-    image: ghcr.io/leisurelyyrsc/cliproxyapibot-client:latest
+  quotanoa-client:
+    image: ghcr.io/leisurelyyrsc/quotanoa-client:latest
     pull_policy: always
     restart: unless-stopped
     init: true

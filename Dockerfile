@@ -18,14 +18,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN groupadd --gid 10001 cpabot \
-    && useradd --uid 10001 --gid cpabot --create-home --shell /usr/sbin/nologin cpabot
+RUN groupadd --gid 10001 quotanoa \
+    && useradd --uid 10001 --gid quotanoa --create-home --shell /usr/sbin/nologin quotanoa
 
 COPY --from=builder /wheels /wheels
 RUN python -m pip install /wheels/*.whl \
     && rm -rf /wheels
 
-USER cpabot
-WORKDIR /home/cpabot
+USER quotanoa
+WORKDIR /home/quotanoa
 
-ENTRYPOINT ["cpabot-client"]
+ENTRYPOINT ["quotanoa-client"]

@@ -14,7 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: leisurelyyrsc/cliproxyapibot-client
+  IMAGE_NAME: leisurelyyrsc/quotanoa-client
 
 jobs:
   publish:
@@ -49,8 +49,8 @@ jobs:
             type=ref,event=tag
             type=sha
           labels: |
-            org.opencontainers.image.title=CliProxyAPIBot Client
-            org.opencontainers.image.description=Remote quota client for CliProxyAPI-Bot Server_Mode
+            org.opencontainers.image.title=QuotaNoa Client
+            org.opencontainers.image.description=Remote quota client for QuotaNoa-Bot Server_Mode
             org.opencontainers.image.vendor=LeiSureLyYrsc
 
       - name: Build and push image
